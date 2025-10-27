@@ -23,8 +23,8 @@ def pil_to_cv2(img_pil: Image.Image) -> cv2.typing.MatLike:
     arr = np.array(img_pil.convert("RGB"))
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
-def cv2_to_pil(img_cv2: cv2.typing.MatLike) -> Image.Image:
-    img_rgb = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2RGB)
+def cv2_to_pil(img_cv2: cv2.typing.MatLike, color_format: ColorFormat=ColorFormat.BGR) -> Image.Image:
+    img_rgb = cv2.cvtColor(img_cv2, cv_code(color_format, ColorFormat.RGB))
     return Image.fromarray(img_rgb)
 
 def hex_to_bgr(hex_string: str) -> cv2.typing.MatLike:
@@ -121,9 +121,7 @@ def compute_transform_from_markers(src_pts: List[Tuple[int, int]], dst_pts: List
         transform_matrix, _ = cv2.findHomography(src, dst, method=0)
     else:
         transform_matrix, _ = cv2.estimateAffine2D(src, dst)
-    
-    print(np.degrees(np.arctan2(transform_matrix[0, 1], transform_matrix[0, 0])))
-    
+     
     return transform_matrix
 
 def warp_image(img: cv2.typing.MatLike, transform_matrix: cv2.typing.MatLike, dsize: cv2.typing.Size) -> cv2.typing.MatLike:
@@ -153,8 +151,8 @@ def calculate_new_coordinates(corners: np.ndarray, transform_matrix: cv2.typing.
     
     return modified_matrix, transformed_corners
 
-def trace_to_contour(img: cv2.typing.MatLike, blur: float=5, canny_threshold1: float=50.0, canny_threshold2: float=150, approx_eps_ratio: float=.01) -> cv2.typing.MatLike:
-    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+def trace_to_contour(img: cv2.typing.MatLike, blur: float=3, canny_threshold1: float=50.0, canny_threshold2: float=150, approx_eps_ratio: float=.01, color_format: ColorFormat=ColorFormat.BGR) -> cv2.typing.MatLike:
+    img_gray = cv2.cvtColor(img, cv_code(color_format, ColorFormat.GRAY))
     
     if blur > 0:
         img_gray = cv2.GaussianBlur(img_gray, (blur, blur), 0)
@@ -195,8 +193,8 @@ def svg_bytes_from_contours(points: List[Tuple[float, float]], width: int, heigh
 def make_download_button(data_bytes, file_name, label):
     st.download_button(label, data=data_bytes, file_name=file_name, mime="image/svg+xml")
     
-def make_st_image(img: cv2.typing.MatLike, caption: str):
-    img_pil = cv2_to_pil(img)
+def make_st_image(img: cv2.typing.MatLike, caption: str, color_format: ColorFormat=ColorFormat.BGR):
+    img_pil = cv2_to_pil(img, color_format)
     st.image(img_pil, caption)
     
 def create_setup_section():
@@ -207,17 +205,18 @@ def create_setup_section():
         image_types = ["png", "jpg", "jpeg", "bmp"]
         uploaded_image = st.file_uploader("Image of item to trace", type=image_types)
         st.caption("Image contain the item + the 3 markers")
-        marker = st.file_uploader("Marker image", type=image_types)
+        marker_image = st.file_uploader("Marker image", type=image_types)
 
     with column2:
-        corner_to_arm_marker_distance = st.slider("Distance from corner marker to arm", 1, 1000, 180)
-    return uploaded_image,marker,corner_to_arm_marker_distance
+        corner_to_arm_marker_distance = st.slider("Distance from corner marker to arm in mm", 1., 1000., 180.)
+        arm_width = st.slider("How wide the arms of the alignment grid are in mm", 1., 1000., 20.)
+    return uploaded_image, marker_image, corner_to_arm_marker_distance, arm_width
 
 def build_page():
-    uploaded_image, marker, corner_to_arm_marker_distance = create_setup_section()
+    uploaded_image, marker_image, corner_to_arm_marker_distance, arm_width = create_setup_section()
         
-    if marker is not None: 
-        marker_pil = Image.open(marker).convert("RGB")
+    if marker_image is not None: 
+        marker_pil = Image.open(marker_image).convert("RGB")
         marker_cv = pil_to_cv2(marker_pil)
         marker_cv = normalize_lighting(marker_cv, ColorFormat.RGB)
         # st.markdown("---")
@@ -229,17 +228,20 @@ def build_page():
         dpi = main_pil.info["dpi"]
         if dpi[0] != dpi[1]:
             raise ValueError("Dpi is not same in x as y for trace image")
-        corner_marker_to_arm_pixel = corner_to_arm_marker_distance / 25.4 * dpi[0]
+        dpmm = dpi[0] / 25.4
+        corner_marker_to_arm_pixel = corner_to_arm_marker_distance * dpmm
+        arm_width_pixel = arm_width * dpmm
+        full_arm_length = corner_marker_to_arm_pixel + arm_width_pixel
         main_cv = pil_to_cv2(main_pil)
         main_cv = normalize_lighting(main_cv, ColorFormat.RGB)
         # make_st_image(main_cv, "Trace image after normalizing lighting")
         
-    if marker is not None:  
+    if marker_image is not None:  
         st.markdown("---")
         st.subheader("Template Matching")
 
     # ---------- Processing ----------
-    if uploaded_image is not None and marker is not None:
+    if uploaded_image is not None and marker_image is not None:
         markers = template_find_markers(main_cv, marker_cv, ColorFormat.RGB, ColorFormat.RGB)
         corner_marker, leg_x, leg_y = organize_markers(markers)
         x_direction = 1 if corner_marker[0] <= leg_x[0] else -1
@@ -252,5 +254,36 @@ def build_page():
         main_transformed = warp_image(main_cv, modified_transform_matrix, new_shape)
         _, transformed_markers = calculate_new_coordinates(organized_markers, modified_transform_matrix)
         make_st_image(draw_markers(main_transformed, transformed_markers), "The red dots show the markers after fixing perspective")
+        
+        alignment_guide_mask = np.ones(main_transformed.shape[:2], dtype=np.float16)
+        arm_start = (round(transformed_markers[0][1] + -1 * y_direction * arm_width_pixel / 2.0), round(transformed_markers[0][0] + -1 * x_direction * arm_width_pixel / 2.0))
+        
+        vertical_start = (arm_start[0], arm_start[1])
+        vertical_end = (int(round(arm_start[0] + y_direction * full_arm_length)), int(arm_start[1] + x_direction * arm_width_pixel))
+        horizontal_start = (arm_start[0], arm_start[1])
+        horizontal_end = (int(round(arm_start[0] + y_direction * arm_width_pixel)), int(arm_start[1] + x_direction * full_arm_length))
+        if y_direction == -1:
+            temp = vertical_start[0]
+            vertical_start = (vertical_end[0], vertical_start[1])
+            vertical_end = (temp, vertical_end[1])
+            temp = horizontal_start[0]
+            horizontal_start = (horizontal_end[0], horizontal_start[1])
+            horizontal_end = (temp, horizontal_end[1])
+            
+        if x_direction == -1:
+            temp = vertical_start[1]
+            vertical_start = (vertical_start[0], vertical_end[1])
+            vertical_end = (vertical_end[0], temp)
+            temp = horizontal_start[1]
+            horizontal_start = (horizontal_start[0], horizontal_end[1])
+            horizontal_end = (horizontal_end[0], temp)
+            
+        # Mask vertical_arm
+        alignment_guide_mask[vertical_start[0]:vertical_end[0], vertical_start[1]:vertical_end[1]] = 0
+        # Mask horizontal_arm
+        alignment_guide_mask[horizontal_start[0]:horizontal_end[0], horizontal_start[1]:horizontal_end[1]] = 0
+        
+        countors, edges = trace_to_contour(main_transformed, color_format=ColorFormat.RGB)
+        make_st_image((edges * alignment_guide_mask).astype(np.uint8), "Contours", ColorFormat.GRAY)
 
 build_page()
