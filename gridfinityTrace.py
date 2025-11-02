@@ -24,7 +24,10 @@ def pil_to_cv2(img_pil: Image.Image) -> cv2.typing.MatLike:
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 def cv2_to_pil(img_cv2: cv2.typing.MatLike, color_format: ColorFormat=ColorFormat.BGR) -> Image.Image:
-    img_rgb = cv2.cvtColor(img_cv2, cv_code(color_format, ColorFormat.RGB))
+    if color_format != ColorFormat.RGB:
+        img_rgb = cv2.cvtColor(img_cv2, cv_code(color_format, ColorFormat.RGB))
+    else:
+        img_rgb = img_cv2
     return Image.fromarray(img_rgb)
 
 def hex_to_bgr(hex_string: str) -> cv2.typing.MatLike:
@@ -151,13 +154,15 @@ def calculate_new_coordinates(corners: np.ndarray, transform_matrix: cv2.typing.
     
     return modified_matrix, transformed_corners
 
-def trace_to_contour(img: cv2.typing.MatLike, blur: float=3, canny_threshold1: float=50.0, canny_threshold2: float=150, approx_eps_ratio: float=.01, color_format: ColorFormat=ColorFormat.BGR) -> cv2.typing.MatLike:
+def trace_to_contour(img: cv2.typing.MatLike, blur: int=5, kernel_size: int=3, canny_threshold1: float=50.0, canny_threshold2: float=200.0, approx_eps_ratio: float=.01, color_format: ColorFormat=ColorFormat.BGR) -> cv2.typing.MatLike:
     img_gray = cv2.cvtColor(img, cv_code(color_format, ColorFormat.GRAY))
     
     if blur > 0:
         img_gray = cv2.GaussianBlur(img_gray, (blur, blur), 0)
         
     edges = cv2.Canny(img_gray, canny_threshold1, canny_threshold2)
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
     
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     
@@ -169,7 +174,7 @@ def trace_to_contour(img: cv2.typing.MatLike, blur: float=3, canny_threshold1: f
     eps = max(1.0, approx_eps_ratio * perim)
     approx = cv2.approxPolyDP(main, eps, True)
     
-    return approx.reshape(-1, 2), edges
+    return approx, edges
 
 def polygon_to_svg_path(points: List[Tuple[float, float]]) -> str:
     if len(points) == 0:
@@ -183,7 +188,7 @@ def polygon_to_svg_path(points: List[Tuple[float, float]]) -> str:
     return d
 
 def svg_bytes_from_contours(points: List[Tuple[float, float]], width: int, height: int, stroke_width=1.0) -> bytes:
-    dwg = svgwrite.Drawing(size=(width, height))
+    dwg = svgwrite.Drawing(size=(f"{width}mm", f"{height}mm"), viewBox=f"0 0 {width} {height}")
     if points is not None and len(points) > 0:
         path_d = polygon_to_svg_path(points)
         dwg.add(dwg.path(d=path_d, fill="none", stroke="black", stroke_width=stroke_width))
@@ -283,7 +288,22 @@ def build_page():
         # Mask horizontal_arm
         alignment_guide_mask[horizontal_start[0]:horizontal_end[0], horizontal_start[1]:horizontal_end[1]] = 0
         
-        countors, edges = trace_to_contour(main_transformed, color_format=ColorFormat.RGB)
-        make_st_image((edges * alignment_guide_mask).astype(np.uint8), "Contours", ColorFormat.GRAY)
+        column1, column2 = st.columns([1, 1])
+        with column2:
+            blur = st.slider("Adjustment for blur", 3, 13, 3, 2)
+            kernel_size = st.slider("Adjustment for kernel to help connect edges", 3, 13, 3, 2)
+            canny_threshold1 = st.slider("Adjustment of how much ", 50, 150, 100)
+            canny_threshold2 = st.slider("", canny_threshold1, 300, canny_threshold1 + 50)
+            
+        contours, edges = trace_to_contour((main_transformed * np.repeat(alignment_guide_mask[:, :, np.newaxis], 3, axis=2)).astype(np.uint8), blur, kernel_size, canny_threshold1, canny_threshold2, color_format=ColorFormat.RGB)
+        masked_edges = (edges * alignment_guide_mask).astype(np.uint8)
+        
+        drawn_countours = main_transformed.copy()
+        drawn_countours = cv2.polylines(drawn_countours, [contours], True, (0, 255, 0), 2)
+        
+        with column1:
+            make_st_image(edges, "Contours", ColorFormat.GRAY)
+            
+        make_st_image(drawn_countours, "Contours", ColorFormat.RGB)
 
 build_page()
