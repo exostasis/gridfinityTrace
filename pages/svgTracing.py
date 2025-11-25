@@ -1,16 +1,18 @@
 from typing import List, Tuple
 import cv2
-import io
 import numpy as np
 from PIL import Image
 import streamlit as st
 from streamlit_cropper import st_cropper
 import svgwrite
-from sklearn.cluster import KMeans
 
 from enum import Enum
 
 from pages.arucoHelper import get_aruco_types
+
+from groundingdino.util.inference import Model
+from segment_anything import sam_model_registry, SamPredictor
+import supervision as sv
 
 DEBUG = True
 
@@ -58,10 +60,6 @@ def normalize_lighting(img: cv2.typing.MatLike, inputFormat: ColorFormat=ColorFo
     
     return cv2.cvtColor(img_equalized, cv_code(ColorFormat.LAB, inputFormat))
 
-def generate_color_mask(img: cv2.typing.MatLike, lower_color_hsv: cv2.typing.MatLike, upper_color_hsv: cv2.typing.MatLike, inputFormat: ColorFormat=ColorFormat.BGR) -> cv2.typing.MatLike:
-    img_hsv = cv2.cvtColor(img, cv_code(inputFormat, ColorFormat.HSV))
-    return cv2.inRange(img_hsv, lower_color_hsv, upper_color_hsv)
-
 def template_find_markers(img: cv2.typing.MatLike, aruco_type: int, img_format: ColorFormat) -> Tuple[List[List[float]], List[int]]:
     img_gray = cv2.cvtColor(img, cv_code(img_format, ColorFormat.GRAY))
     aruco_dictionary = cv2.aruco.getPredefinedDictionary(aruco_type)
@@ -70,111 +68,192 @@ def template_find_markers(img: cv2.typing.MatLike, aruco_type: int, img_format: 
      
     return detector.detectMarkers(img_gray)
 
-def find_center_from_top_left(top_left_point: Tuple[float, float], shape: Tuple[int, int]) -> Tuple[int, int]:
-    y, x = top_left_point
-    height, width = shape
-    return (round(x + width / 2.0), round(y + height / 2.0))
+def correct_image(aruco_type, aruco_board_dimensions, aruco_spacing_mm, aruco_size_mm, total_points, main_cv, image_width, image_height, corners, ids):
+    aruco_dictionary = cv2.aruco.getPredefinedDictionary(aruco_type)
+    board = cv2.aruco.GridBoard(aruco_board_dimensions, aruco_size_mm, aruco_spacing_mm, aruco_dictionary)
+    object_points = np.array([board.getObjPoints()[int(id)] for id in ids], dtype=np.float32).reshape(-1, 3)
+    image_points = np.array([corners[int(id)][0] for id in range(total_points)], dtype=np.float32).reshape(-1, 2)
+ 
+    H, _ = cv2.findHomography(image_points, object_points[:, :2])
+        
+    final_dimensions, H_shifted = shift_homography(image_width, image_height, H)
+    corrected_image = cv2.warpPerspective(main_cv, H_shifted, final_dimensions)
+    
+    return corrected_image
 
-def angle(u: Tuple[int, int], v: Tuple[int, int]) -> float:
-    return np.degrees(
-        np.arccos(
-            np.clip(np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v)), -1.0, 1.0)
-        )
+def shift_homography(image_width, image_height, H):
+    # Calculate new bounding box
+    image_corners = np.array([[0,0], [image_width, 0], [image_width, image_height], [0, image_height]], dtype=np.float32)
+    final_corners = cv2.perspectiveTransform(image_corners[None, :, :], H)
+    
+    min_x, min_y = final_corners.reshape(-1, 2).min(axis=0)
+    max_x, max_y = final_corners.reshape(-1, 2).max(axis=0)
+    final_dimensions = int(np.ceil(max_x - min_x)), int(np.ceil(max_y - min_y))
+    T = np.array([[1, 0, -min_x],
+                      [0, 1, -min_y],
+                      [0, 0, 1]])
+    H_shifted = T @ H
+    
+    return final_dimensions, H_shifted
+
+def shadow_removal(corrected, color_format):
+    hsv = cv2.cvtColor(corrected, cv_code(color_format, ColorFormat.HSV))
+    h, s, v = cv2.split(hsv)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    v_clahe = clahe.apply(v)
+    v_norm = cv2.normalize(v_clahe, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+    hsv_corrected = cv2.merge([h, s, v_norm])
+    illum_corrected = cv2.cvtColor(hsv_corrected, cv_code(ColorFormat.HSV, ColorFormat.BGR))
+    bgr = cv2.split(illum_corrected)
+    correct_channels = []
+    for ch in bgr:
+        dillatd = cv2.dilate(ch, np.ones((9, 9), np.uint8))
+        bg = cv2.medianBlur(dillatd, 31)
+        diff = 255 - cv2.absdiff(ch, bg)
+        correct_channels.append(diff)
+    
+    return cv2.merge(correct_channels)
+    # h, w = dimensions
+    # k = int(max(51, min(h, w) * .2))
+    # if k % 2 == 0:
+    #     k += 1
+    
+    # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    # background = cv2.morphologyEx(corrected_gray, cv2.MORPH_CLOSE, kernel)
+    # normalized = cv2.normalize((corrected_gray.astype(np.float32) - background.astype(np.float32)), None, 0, 255, cv2.NORM_MINMAX)
+    # return np.clip(normalized, 0, 255).astype(np.uint8)
+    
+def msrcr(img, scales=[15,80,250], G=5.0, b=25.0, alpha=125.0, beta=46.0):
+    # Multi-scale Retinex with Color Restoration (basic)
+    img = img.astype(np.float32) + 1.0
+    retinex = np.zeros_like(img)
+    for s in scales:
+        blur = cv2.GaussianBlur(img, (0,0), s)
+        retinex += np.log(img) - np.log(blur + 1e-8)
+    retinex = retinex / len(scales)
+    # color restoration
+    sum_channels = np.sum(img, axis=2, keepdims=True)
+    c = alpha * (np.log(beta * img) - np.log(sum_channels + 1e-8))
+    msrcr = G * (retinex * c + b)
+    # normalize to 0..255
+    msrcr = (msrcr - msrcr.min())/(msrcr.max()-msrcr.min())*255.0
+    msrcr = np.clip(msrcr, 0, 255).astype(np.uint8)
+    return msrcr
+
+def remove_shadows_retinex(bgr):
+    # Convert to float
+    img = bgr.astype(np.float32) / 255.0
+
+    # Parameters for MSR
+    sigma_list = [15, 80, 250]
+
+    retinex = np.zeros_like(img)
+    for sigma in sigma_list:
+        blur = cv2.GaussianBlur(img, (0,0), sigma)
+        retinex += np.log10(img + 1e-6) - np.log10(blur + 1e-6)
+
+    retinex = retinex / len(sigma_list)
+
+    # Normalize to 0–255
+    retinex = (retinex - np.min(retinex)) / (np.max(retinex) - np.min(retinex))
+    retinex = (retinex * 255).astype(np.uint8)
+
+    return retinex
+
+def process_image(aruco_type, aruco_board_dimensions, aruco_spacing_mm, aruco_size_mm, total_points, main_cv):
+    image_width, image_height = main_cv.shape[:2][::-1]
+        
+    corners, ids, _ = template_find_markers(main_cv, aruco_type, ColorFormat.BGR)
+    detected_markers_img = main_cv.copy()
+    cv2.aruco.drawDetectedMarkers(detected_markers_img, corners, ids)
+    st.divider()
+    
+    if DEBUG:
+        make_st_image(detected_markers_img, "Detected markers", ColorFormat.BGR)
+        
+    corrected_image = correct_image(aruco_type, aruco_board_dimensions, aruco_spacing_mm, aruco_size_mm, total_points, main_cv, image_width, image_height, corners, ids)
+    
+    if DEBUG:
+        make_st_image(corrected_image, "Results after warpPerspective", ColorFormat.BGR)
+        
+    # # --- SHADOW ROBUST PREPROCESSING -----------------------------------
+    # # Convert to LAB because L channel separates lighting from color
+    # lab = cv2.cvtColor(corrected_image, cv2.COLOR_BGR2LAB)
+    # L, A, B = cv2.split(lab)
+
+    # # 1) Estimate illumination using a large Gaussian blur
+    # illum = cv2.GaussianBlur(L, (0, 0), sigmaX=35, sigmaY=35)
+
+    # # Avoid divide-by-zero
+    # illum = np.maximum(illum, 1)
+
+    # # 2) Flatten illumination (homomorphic-like)
+    # L_flat = (L.astype(np.float32) / illum) * 128
+    # L_flat = cv2.normalize(L_flat, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # # 3) Local contrast improvement
+    # clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+    # L_final = clahe.apply(L_flat)
+
+    # # Reassemble image for visualization (optional)
+    # shadow_free = cv2.merge([L_final, A, B])
+    # shadow_free_bgr = cv2.cvtColor(shadow_free, cv2.COLOR_LAB2BGR)
+
+    # if DEBUG:
+    #     make_st_image(shadow_free_bgr, "Shadow-corrected (LAB Illumination Flattened)", ColorFormat.BGR)
+
+    # # --- EDGE DETECTION (clean & stable) --------------------------------
+    # # Smooth noise without destroying edges
+    # blur = cv2.bilateralFilter(L_final, 7, 75, 75)
+
+    # # Canny on cleaned luminance
+    # edges = cv2.Canny(blur, 40, 120)
+
+    # # Close gaps in the contour
+    # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    # edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    # edges = cv2.dilate(edges, kernel, iterations=1)
+
+    # if DEBUG:
+    #     make_st_image(edges, "Edges after shadow removal", ColorFormat.GRAY)
+    
+    # ------------ SHADOW-INVARIANT OBJECT SEGMENTATION ----------------
+    dino = Model(
+        model_config_path=".venv/lib/python3.12/site-packages/groundingdino/config/GroundingDINO_SwinT_OGC.py",
+        model_checkpoint_path="models/gdino_swint_ogc.pth"
     )
-
-def organize_markers(markers: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
-    marker_a, marker_b, marker_c = markers
     
-    marker_a = np.array(markers[0])
-    marker_b = np.array(markers[1])
-    marker_c = np.array(markers[2])
+    detections, descriptions = dino.predict_with_caption(
+        image=corrected_image,
+        caption="Detected items",
+        box_threshold=.25,
+        text_threshold=.25
+    )
     
-    angle_a = angle(marker_b - marker_a, marker_c - marker_a)
-    angle_b = angle(marker_a - marker_b, marker_c - marker_b)
-    angle_c = angle(marker_a - marker_c, marker_b - marker_c)
+    if len(detections) == 0:
+        st.markdown("Nothing detected")
+    padding = 2
     
-    angles = np.array([round(angle_a), round(angle_b), round(angle_c)])
-    if (angles > 45).sum() == 2:  
-        center_index = np.argmin(angles)
-    else: 
-        center_index = np.argmax(angles)
-    
-    corner_marker = markers[center_index]
-    leg_marker_1, leg_marker_2 = markers[:center_index] + markers[center_index+1:]
-    
-    # choose the marker closet to horizontal with corner
-    if abs(corner_marker[1] - leg_marker_1[1]) <= abs(corner_marker[1] - leg_marker_2[1]):
-        return (corner_marker, leg_marker_1, leg_marker_2)
-    else:
-        return (corner_marker, leg_marker_2, leg_marker_1)  
-
-def draw_markers(img: cv2.typing.MatLike, centers: List[Tuple[int, int]], color=(0, 0, 255), radius=8) -> cv2.typing.MatLike:
-    marked_img = img.copy()
-    for x, y in centers:
-        cv2.circle(marked_img, (round(x), round(y)), radius, color, -1)
-        
-    return marked_img
-
-def compute_transform_from_markers(src_pts: List[Tuple[int, int]], dst_pts: List[Tuple[int, int]]) -> cv2.typing.MatLike:
-    full_projection = len(src_pts) >= 4
-    src = np.array(src_pts, dtype=np.float32)
-    dst = np.array(dst_pts, dtype=np.float32)
-    
-    if full_projection:
-        transform_matrix, _ = cv2.findHomography(src, dst, method=0)
-    else:
-        transform_matrix, _ = cv2.estimateAffine2D(src, dst)
-     
-    return transform_matrix
-
-def warp_image(img: cv2.typing.MatLike, transform_matrix: cv2.typing.MatLike, dsize: cv2.typing.Size) -> cv2.typing.MatLike:
-    if transform_matrix.shape == (3, 3):
-        return cv2.warpPerspective(img, transform_matrix, dsize)
-    else:
-        return cv2.warpAffine(img, transform_matrix, dsize)
-    
-def adjust_transform(img_shape: Tuple[int, int], transform_matrix: cv2.typing.MatLike) -> Tuple[Tuple[int, int], cv2.typing.MatLike]:
-    corners = np.float32([[0, 0], [img_shape[0], 0], [img_shape[0], img_shape[1]], [0, img_shape[1]]])
-    modified_matrix, transformed_corners = calculate_new_coordinates(corners, transform_matrix)
-    min_x = np.min(transformed_corners[:, 0])
-    max_x = np.max(transformed_corners[:, 0])
-    
-    min_y = np.min(transformed_corners[:, 1])
-    max_y = np.max(transformed_corners[:, 1])
-    
-    new_shape = (round(max_x - min_x), round(max_y - min_y))
-    translation = np.array([[1, 0, -min_x], [0, 1, -min_y]], dtype=np.float32)
-    m_corrected = translation @ np.vstack(modified_matrix)
-    
-    return new_shape, m_corrected[:2]
-
-def calculate_new_coordinates(corners: np.ndarray, transform_matrix: cv2.typing.MatLike):
-    modified_matrix = np.vstack([transform_matrix, [0, 0, 1]])
-    transformed_corners = cv2.transform(np.array([corners]), modified_matrix[:2])[0]
-    
-    return modified_matrix, transformed_corners
-
-def trace_to_contour(img: cv2.typing.MatLike, blur: int=5, kernel_size: int=3, canny_threshold1: float=50.0, canny_threshold2: float=200.0, approx_eps_ratio: float=.01, color_format: ColorFormat=ColorFormat.BGR) -> cv2.typing.MatLike:
-    img_gray = cv2.cvtColor(img, cv_code(color_format, ColorFormat.GRAY))
-    
-    if blur > 0:
-        img_gray = cv2.GaussianBlur(img_gray, (blur, blur), 0)
-        
-    edges = cv2.Canny(img_gray, canny_threshold1, canny_threshold2)
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
-    
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    
-    if len(contours) == 0:
-        return None, edges
-    
-    main = max(contours, key=cv2.contourArea)
-    perim = cv2.arcLength(main, True)
-    eps = max(1.0, approx_eps_ratio * perim)
-    approx = cv2.approxPolyDP(main, eps, True)
-    
-    return approx, edges
+    for box in detections:
+        x1, y1, x2, y2 = box[0]
+        x1, y1, x2, y2 = int(x1 - padding), int(y1 - padding), int(round(x2) + padding), int(round(y2) + padding)
+        roi = corrected_image[y1:y2, x1:x2]
+        make_st_image(roi, "detected objects")
+        sam = sam_model_registry["vit_h"](checkpoint="models/sam_vit_h.pth")
+        predictor = SamPredictor(sam)
+        predictor.set_image(corrected_image)
+        tool_mask, _, _ = predictor.predict(
+            box=np.array([x1, y1, x2, y2])
+        )
+        if tool_mask.dtype != np.uint8:
+            tool_mask = (tool_mask * 255).astype(np.uint8)
+        if len(tool_mask.shape) == 3:
+            tool_mask = np.transpose(tool_mask, (1, 2, 0))
+            tool_mask = cv2.cvtColor(tool_mask, cv_code(ColorFormat.BGR, ColorFormat.GRAY))
+        cnts, _ = cv2.findContours(tool_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        main = max(cnts, key=cv2.contourArea)
+        contour_image = corrected_image.copy()
+        make_st_image(cv2.drawContours(contour_image, [main], -1, (0, 255, 0), 1), "Contour found", ColorFormat.BGR)
 
 def polygon_to_svg_path(points: List[Tuple[float, float]]) -> str:
     if len(points) == 0:
@@ -232,44 +311,10 @@ def build_page():
         with column2:
             main_cv = pil_to_cv2(main_pil)
             make_st_image(main_cv, "Cropped image", ColorFormat.BGR)
-            main_cv = normalize_lighting(main_cv, ColorFormat.RGB)
             
         
     # ---------- Processing ----------
     if uploaded_image is not None:
-        image_size = main_cv.shape[:2][::-1]
-        
-        corners, ids, _ = template_find_markers(main_cv, aruco_type, ColorFormat.BGR)
-        detected_markers_img = main_cv.copy()
-        cv2.aruco.drawDetectedMarkers(detected_markers_img, corners, ids)
-        st.divider()
-        if DEBUG:
-            make_st_image(detected_markers_img, "Detected markers", ColorFormat.BGR)
-        aruco_dictionary = cv2.aruco.getPredefinedDictionary(aruco_type)
-        board = cv2.aruco.GridBoard(aruco_board_dimensions, aruco_size_mm, aruco_spacing_mm, aruco_dictionary)
-        object_points = np.array([board.getObjPoints()[int(id)] for id in ids], dtype=np.float32).reshape(-1, 3)
-        image_points = np.array([corners[int(id)][0] for id in range(total_points)], dtype=np.float32).reshape(-1, 2)
-
-        object_points_min_x = object_points[:,0].min()
-        object_points_min_y = object_points[:,1].min()
-        
-        object_points_normalized = object_points.copy()
-        object_points_normalized[:, 0] -= object_points_min_x
-        object_points_normalized[:, 1] -= object_points_min_y
-        
-        H, _ = cv2.findHomography(image_points, object_points[:, :2])
-        
-        image_corners = np.array([[0,0], [image_size[0], 0], [image_size[0], image_size[1]], [0, image_size[1]]], dtype=np.float32)
-        final_corners = cv2.perspectiveTransform(image_corners[None, :, :], H)
-        min_x, min_y = final_corners.reshape(-1, 2).min(axis=0)
-        max_x, max_y = final_corners.reshape(-1, 2).max(axis=0)
-        final_dimensions = int(np.ceil(max_x - min_x)), int(np.ceil(max_y - min_y))
-        T = np.array([[1, 0, -min_x],
-                      [0, 1, -min_y],
-                      [0, 0, 1]])
-        H_shifted = T @ H
-        warped_image = cv2.warpPerspective(main_cv, H_shifted, final_dimensions)
-        if DEBUG:
-            make_st_image(warped_image, "Results after warpPerspective", ColorFormat.BGR)
-        
+        process_image(aruco_type, aruco_board_dimensions, aruco_spacing_mm, aruco_size_mm, total_points, main_cv)
+ 
 build_page()
